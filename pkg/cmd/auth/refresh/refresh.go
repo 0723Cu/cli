@@ -1,52 +1,70 @@
 package refresh
 
 import (
-	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 
-	"github.com/AlecAivazis/survey/v2"
 	"github.com/MakeNowJust/heredoc"
+	"github.com/cli/cli/v2/git"
 	"github.com/cli/cli/v2/internal/authflow"
 	"github.com/cli/cli/v2/internal/config"
 	"github.com/cli/cli/v2/pkg/cmd/auth/shared"
 	"github.com/cli/cli/v2/pkg/cmdutil"
 	"github.com/cli/cli/v2/pkg/iostreams"
-	"github.com/cli/cli/v2/pkg/prompt"
 	"github.com/spf13/cobra"
 )
 
 type RefreshOptions struct {
-	IO     *iostreams.IOStreams
-	Config func() (config.Config, error)
+	IO         *iostreams.IOStreams
+	Config     func() (config.Config, error)
+	HttpClient *http.Client
+	GitClient  *git.Client
+	Prompter   shared.Prompt
 
 	MainExecutable string
 
 	Hostname string
 	Scopes   []string
-	AuthFlow func(config.Config, *iostreams.IOStreams, string, []string) error
+	AuthFlow func(*config.AuthConfig, *iostreams.IOStreams, string, []string, bool, bool) error
 
-	Interactive bool
+	Interactive   bool
+	SecureStorage bool
 }
 
 func NewCmdRefresh(f *cmdutil.Factory, runF func(*RefreshOptions) error) *cobra.Command {
 	opts := &RefreshOptions{
 		IO:     f.IOStreams,
 		Config: f.Config,
-		AuthFlow: func(cfg config.Config, io *iostreams.IOStreams, hostname string, scopes []string) error {
-			_, err := authflow.AuthFlowWithConfig(cfg, io, hostname, "", scopes)
-			return err
+		AuthFlow: func(authCfg *config.AuthConfig, io *iostreams.IOStreams, hostname string, scopes []string, interactive, secureStorage bool) error {
+			if secureStorage {
+				cs := io.ColorScheme()
+				fmt.Fprintf(io.ErrOut, "%s Using secure storage could break installed extensions", cs.WarningIcon())
+			}
+			token, username, err := authflow.AuthFlow(hostname, io, "", scopes, interactive, f.Browser)
+			if err != nil {
+				return err
+			}
+			return authCfg.Login(hostname, username, token, "", secureStorage)
 		},
-		MainExecutable: f.Executable,
+		HttpClient: &http.Client{},
+		GitClient:  f.GitClient,
+		Prompter:   f.Prompter,
 	}
 
 	cmd := &cobra.Command{
 		Use:   "refresh",
 		Args:  cobra.ExactArgs(0),
 		Short: "Refresh stored authentication credentials",
-		Long: heredoc.Doc(`Expand or fix the permission scopes for stored credentials
+		Long: heredoc.Doc(`Expand or fix the permission scopes for stored credentials.
 
-			The --scopes flag accepts a comma separated list of scopes you want your gh credentials to have. If
-			absent, this command ensures that gh has access to a minimum set of scopes.
+			The --scopes flag accepts a comma separated list of scopes you want
+			your gh credentials to have. If no scopes are provided, the command
+			maintains previously added scopes.
+
+			The command can only add additional scopes, but not remove previously
+			added ones. To reset scopes to the default minimum set of scopes, you
+			will need to create new credentials using the auth login command.
 		`),
 		Example: heredoc.Doc(`
 			$ gh auth refresh --scopes write:org,read:public_key
@@ -59,9 +77,10 @@ func NewCmdRefresh(f *cmdutil.Factory, runF func(*RefreshOptions) error) *cobra.
 			opts.Interactive = opts.IO.CanPrompt()
 
 			if !opts.Interactive && opts.Hostname == "" {
-				return &cmdutil.FlagError{Err: errors.New("--hostname required when not running interactively")}
+				return cmdutil.FlagErrorf("--hostname required when not running interactively")
 			}
 
+			opts.MainExecutable = f.Executable()
 			if runF != nil {
 				return runF(opts)
 			}
@@ -71,6 +90,7 @@ func NewCmdRefresh(f *cmdutil.Factory, runF func(*RefreshOptions) error) *cobra.
 
 	cmd.Flags().StringVarP(&opts.Hostname, "hostname", "h", "", "The GitHub host to use for authentication")
 	cmd.Flags().StringSliceVarP(&opts.Scopes, "scopes", "s", nil, "Additional authentication scopes for gh to have")
+	cmd.Flags().BoolVarP(&opts.SecureStorage, "secure-storage", "", false, "Save authentication credentials in secure credential store")
 
 	return cmd
 }
@@ -80,11 +100,9 @@ func refreshRun(opts *RefreshOptions) error {
 	if err != nil {
 		return err
 	}
+	authCfg := cfg.Authentication()
 
-	candidates, err := cfg.Hosts()
-	if err != nil {
-		return err
-	}
+	candidates := authCfg.Hosts()
 	if len(candidates) == 0 {
 		return fmt.Errorf("not logged in to any hosts. Use 'gh auth login' to authenticate with a host")
 	}
@@ -94,14 +112,11 @@ func refreshRun(opts *RefreshOptions) error {
 		if len(candidates) == 1 {
 			hostname = candidates[0]
 		} else {
-			err := prompt.SurveyAskOne(&survey.Select{
-				Message: "What account do you want to refresh auth for?",
-				Options: candidates,
-			}, &hostname)
-
+			selected, err := opts.Prompter.Select("What account do you want to refresh auth for?", "", candidates)
 			if err != nil {
 				return fmt.Errorf("could not prompt: %w", err)
 			}
+			hostname = candidates[selected]
 		}
 	} else {
 		var found bool
@@ -117,20 +132,37 @@ func refreshRun(opts *RefreshOptions) error {
 		}
 	}
 
-	if err := cfg.CheckWriteable(hostname, "oauth_token"); err != nil {
-		var roErr *config.ReadOnlyEnvError
-		if errors.As(err, &roErr) {
-			fmt.Fprintf(opts.IO.ErrOut, "The value of the %s environment variable is being used for authentication.\n", roErr.Variable)
-			fmt.Fprint(opts.IO.ErrOut, "To refresh credentials stored in GitHub CLI, first clear the value from the environment.\n")
-			return cmdutil.SilentError
-		}
-		return err
+	if src, writeable := shared.AuthTokenWriteable(authCfg, hostname); !writeable {
+		fmt.Fprintf(opts.IO.ErrOut, "The value of the %s environment variable is being used for authentication.\n", src)
+		fmt.Fprint(opts.IO.ErrOut, "To refresh credentials stored in GitHub CLI, first clear the value from the environment.\n")
+		return cmdutil.SilentError
 	}
 
 	var additionalScopes []string
+	if oldToken, source := authCfg.Token(hostname); oldToken != "" {
+		if oldScopes, err := shared.GetScopes(opts.HttpClient, hostname, oldToken); err == nil {
+			for _, s := range strings.Split(oldScopes, ",") {
+				s = strings.TrimSpace(s)
+				if s != "" {
+					additionalScopes = append(additionalScopes, s)
+				}
+			}
+		}
 
-	credentialFlow := &shared.GitCredentialFlow{}
-	gitProtocol, _ := cfg.Get(hostname, "git_protocol")
+		// If previous token was stored in secure storage assume
+		// user wants to continue storing it there even if not
+		// explicitly stated with the secure storage flag.
+		if source == "keyring" {
+			opts.SecureStorage = true
+		}
+	}
+
+	credentialFlow := &shared.GitCredentialFlow{
+		Executable: opts.MainExecutable,
+		Prompter:   opts.Prompter,
+		GitClient:  opts.GitClient,
+	}
+	gitProtocol, _ := authCfg.GitProtocol(hostname)
 	if opts.Interactive && gitProtocol == "https" {
 		if err := credentialFlow.Prompt(hostname); err != nil {
 			return err
@@ -138,13 +170,16 @@ func refreshRun(opts *RefreshOptions) error {
 		additionalScopes = append(additionalScopes, credentialFlow.Scopes()...)
 	}
 
-	if err := opts.AuthFlow(cfg, opts.IO, hostname, append(opts.Scopes, additionalScopes...)); err != nil {
+	if err := opts.AuthFlow(authCfg, opts.IO, hostname, append(opts.Scopes, additionalScopes...), opts.Interactive, opts.SecureStorage); err != nil {
 		return err
 	}
 
+	cs := opts.IO.ColorScheme()
+	fmt.Fprintf(opts.IO.ErrOut, "%s Authentication complete.\n", cs.SuccessIcon())
+
 	if credentialFlow.ShouldSetup() {
-		username, _ := cfg.Get(hostname, "user")
-		password, _ := cfg.Get(hostname, "oauth_token")
+		username, _ := authCfg.User(hostname)
+		password, _ := authCfg.Token(hostname)
 		if err := credentialFlow.Setup(hostname, username, password); err != nil {
 			return err
 		}
